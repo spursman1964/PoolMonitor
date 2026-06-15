@@ -1,0 +1,16 @@
+pool:
+  name: Main Pool
+  volume_litres: 50000
+
+logging:
+  interval_seconds: 3
+
+targets:
+  ph_low: 7.2
+  ph_target: 7.5
+  ph_high: 7.8
+
+  temp_low: 20
+  temp_high: 32
+
+  salt_target: 4000
