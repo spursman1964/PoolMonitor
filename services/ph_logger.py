@@ -18,9 +18,10 @@ LOG_INTERVAL = settings["logging"]["interval_seconds"]
 sys.path.append(str(PROJECT_ROOT / "sensors"))
 
 from ph_sensor import read_ph
+from temperature_sensor import read_temperature
 
 
-def store_reading(ph_value):
+def store_reading(ph_value, temperature_value):
 
     connection = sqlite3.connect(DB_PATH)
     cursor = connection.cursor()
@@ -28,12 +29,13 @@ def store_reading(ph_value):
     cursor.execute(
         """
         INSERT INTO readings
-        (timestamp, ph)
-        VALUES (?, ?)
+        (timestamp, ph, temperature_c)
+        VALUES (?, ?, ?)
         """,
         (
             datetime.now().isoformat(timespec="seconds"),
             ph_value,
+            temperature_value,
         ),
     )
 
@@ -43,19 +45,28 @@ def store_reading(ph_value):
 
 while True:
 
+    ph = None
+    temperature = None
+
     try:
-
         ph = read_ph()
-
-        store_reading(ph)
-
-        print(
-            f"{datetime.now().isoformat(timespec='seconds')} "
-            f"pH={ph}"
-        )
-
     except Exception as error:
+        print(f"ERROR reading pH: {error}")
 
-        print(f"ERROR: {error}")
+    try:
+        temperature = read_temperature()
+    except Exception as error:
+        print(f"ERROR reading temperature: {error}")
+
+    if ph is not None or temperature is not None:
+        try:
+            store_reading(ph, temperature)
+
+            print(
+                f"{datetime.now().isoformat(timespec='seconds')} "
+                f"pH={ph} temp_c={temperature}"
+            )
+        except Exception as error:
+            print(f"ERROR storing reading: {error}")
 
     time.sleep(LOG_INTERVAL)

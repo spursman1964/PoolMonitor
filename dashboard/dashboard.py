@@ -1,7 +1,8 @@
-import csv
+[200~import csv
 import io
 import re
 import sqlite3
+import yaml
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlencode
@@ -10,17 +11,58 @@ from flask import Flask, jsonify, request, Response
 
 app = Flask(__name__)
 
+# Bump this whenever dashboard.py changes. Shown in the top bar so you can
+# confirm at a glance whether the browser/service is serving the latest code.
+DASHBOARD_VERSION = "2.1.0 (adaptive chart granularity)"
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = PROJECT_ROOT / "data" / "poolmonitor.db"
+CONFIG_PATH = PROJECT_ROOT / "config" / "settings.yaml"
 
-# Whitelisted metrics. Only "ph" has data today; temperature/salinity are
-# wired up here so the same endpoint works once those columns are populated
-# (per the roadmap), without any extra backend changes.
-METRIC_COLUMNS = {
-    "ph": "ph",
-    "temperature": "temperature_c",
-    "salinity": "salinity_ppm",
-}
+try:
+    with open(CONFIG_PATH, "r") as _file:
+        _settings = yaml.safe_load(_file) or {}
+except FileNotFoundError:
+    _settings = {}
+
+_targets = _settings.get("targets", {})
+
+# Single source of truth for every sensor shown on the dashboard. To add a
+# new sensor (e.g. ORP, flow), add one entry here -- the metric tiles, the
+# chart's metric switcher, and the OHLC API all key off this list, so no
+# other rendering code needs to change.
+METRICS = [
+    {
+        "id": "ph",
+        "label": "pH",
+        "column": "ph",
+        "unit": "",
+        "decimals": 2,
+        "low": _targets.get("ph_low"),
+        "high": _targets.get("ph_high"),
+    },
+    {
+        "id": "temperature",
+        "label": "Temperature",
+        "column": "temperature_c",
+        "unit": "\u00b0C",
+        "decimals": 1,
+        "low": _targets.get("temp_low"),
+        "high": _targets.get("temp_high"),
+    },
+    {
+        "id": "salinity",
+        "label": "Salinity",
+        "column": "salinity_ppm",
+        "unit": "ppm",
+        "decimals": 0,
+        "low": _targets.get("salt_target", 0) * 0.9 if _targets.get("salt_target") else None,
+        "high": _targets.get("salt_target", 0) * 1.1 if _targets.get("salt_target") else None,
+    },
+]
+
+METRIC_COLUMNS = {m["id"]: m["column"] for m in METRICS}
+METRIC_BY_ID = {m["id"]: m for m in METRICS}
 
 # Accepts things like "1h", "12h", "24h", "7d", "30d", "6m", "1y"
 RANGE_PATTERN = re.compile(r"^(\d+)\s*([hdwmy])$", re.IGNORECASE)
@@ -58,21 +100,72 @@ def parse_range_to_hours(range_str):
 
 def choose_bucket_expression(total_hours):
     """
-    Pick a candle width that fits the requested lookback window, so a 1-hour
-    view doesn't collapse into a single candle and a 1-year view doesn't
-    return thousands of them. This is chosen server-side from a fixed set of
-    options below -- it is never built directly from user input.
+    Target approximately 100 candles per view by dividing the total window
+    (in minutes) by 100, then rounding UP to the nearest step on a fixed
+    ladder of clean SQLite-expressible intervals.
+
+    The ladder (in minutes):
+        1, 2, 5, 10, 15, 30, 60, 120, 240, 360, 720, 1440, 10080, 43200
+
+    Example outputs at the preset range buttons:
+        1H   ->  1 min  (60 candles)
+        6H   -> 10 min  (36 candles)
+        12H  -> 10 min  (72 candles)
+        24H  -> 15 min  (96 candles)
+        3D   ->  1 hour (72 candles)
+        1W   ->  1 hour (168 candles)
+        1M   ->  6 hour (120 candles)
+        3M   ->  1 day  (90 candles)
+        6M   ->  1 day  (180 candles)
+        1Y   ->  1 week (52 candles)
+
+    Expressions are chosen from a fixed whitelist -- never built from user
+    input -- so there is no SQL injection risk.
     """
-    if total_hours <= 2:
-        return "strftime('%Y-%m-%dT%H:%M:00', timestamp)"          # 1-minute
-    if total_hours <= 48:
-        return "strftime('%Y-%m-%dT%H:00:00', timestamp)"           # hourly
-    if total_hours <= 24 * 60:
-        return "strftime('%Y-%m-%dT00:00:00', timestamp)"           # daily
-    if total_hours <= 24 * 400:
-        return ("strftime('%Y-%m-%dT00:00:00', "
-                 "date(timestamp, 'weekday 0', '-6 days'))")          # weekly
-    return "strftime('%Y-%m-01T00:00:00', timestamp)"                # monthly
+    LADDER = [1, 2, 5, 10, 15, 30, 60, 120, 240, 360, 720, 1440, 10080, 43200]
+
+    total_minutes = total_hours * 60
+    ideal = total_minutes / 100          # target 100 candles
+    # Pick the first ladder step >= ideal (round up for more definition).
+    # Then walk back down if the result gives fewer than 40 candles (too sparse).
+    idx = next((i for i, s in enumerate(LADDER) if s >= ideal), len(LADDER) - 1)
+    while idx > 0 and (total_minutes // LADDER[idx]) < 40:
+        idx -= 1
+    bucket_minutes = LADDER[idx]
+
+    # Map the chosen bucket width to a SQLite strftime expression.
+    # SQLite has no native "truncate to N minutes" function, so for
+    # sub-hour intervals we use integer arithmetic on the Unix epoch
+    # via the julianday trick, then format back to ISO text.
+    if bucket_minutes < 60:
+        seconds = bucket_minutes * 60
+        # Round the epoch to the nearest bucket then format as ISO.
+        # This expression is safe: `seconds` is an integer from our whitelist.
+        return (
+            f"strftime('%Y-%m-%dT%H:%M:00', "
+            f"datetime(CAST((strftime('%s', timestamp) / {seconds}) AS INTEGER)"
+            f" * {seconds}, 'unixepoch'))"
+        )
+    elif bucket_minutes < 1440:
+        hours = bucket_minutes // 60
+        if hours == 1:
+            return "strftime('%Y-%m-%dT%H:00:00', timestamp)"
+        # Round down to nearest N-hour block using the same epoch trick.
+        seconds = hours * 3600
+        return (
+            f"strftime('%Y-%m-%dT%H:00:00', "
+            f"datetime(CAST((strftime('%s', timestamp) / {seconds}) AS INTEGER)"
+            f" * {seconds}, 'unixepoch'))"
+        )
+    elif bucket_minutes == 1440:
+        return "strftime('%Y-%m-%dT00:00:00', timestamp)"        # daily
+    elif bucket_minutes == 10080:
+        return (                                                   # weekly (Mon)
+            "strftime('%Y-%m-%dT00:00:00', "
+            "date(timestamp, 'weekday 0', '-6 days'))"
+        )
+    else:
+        return "strftime('%Y-%m-01T00:00:00', timestamp)"         # monthly
 
 
 @app.route("/api/ph/ohlc")
@@ -299,113 +392,336 @@ def export_csv():
 # uses an f-string, and only over named variables.
 
 DASHBOARD_CSS = """
+:root {
+    --ink: #0F1B22;
+    --panel: #16252D;
+    --panel-raised: #1C2E37;
+    --border: #283940;
+    --text: #E8EDEE;
+    --text-muted: #8FA3AA;
+    --accent: #4FD1C5;
+    --warn: #E2A33D;
+    --alarm: #E5484D;
+}
+
+* {
+    box-sizing: border-box;
+}
+
 body {
-    font-family: Arial, sans-serif;
-    margin: 40px;
-    background: #f4f6f8;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    margin: 0;
+    padding: 20px 20px 60px;
+    background: var(--ink);
+    color: var(--text);
 }
 
-.card {
-    background: white;
-    padding: 25px;
-    border-radius: 12px;
-    max-width: 700px;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
-    margin-bottom: 25px;
+a {
+    color: var(--accent);
 }
 
-.ph-value {
-    font-size: 64px;
-    font-weight: bold;
+.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-bottom: 22px;
 }
 
-table {
-    border-collapse: collapse;
-    background: white;
+.topbar-left {
+    display: flex;
+    align-items: center;
+    gap: 10px;
 }
 
-th, td {
-    padding: 10px 14px;
-    border: 1px solid #ccc;
+.live-dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--accent);
+    box-shadow: 0 0 0 0 rgba(79, 209, 197, 0.6);
+    animation: pulse 2s infinite;
+    flex-shrink: 0;
 }
 
-th {
-    background: #e9ecef;
+@keyframes pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(79, 209, 197, 0.5); }
+    70%  { box-shadow: 0 0 0 7px rgba(79, 209, 197, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(79, 209, 197, 0); }
 }
 
-.range-buttons button {
-    margin-right: 6px;
-    margin-bottom: 8px;
-    padding: 6px 12px;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-    background: #f0f0f0;
-    cursor: pointer;
-}
-
-.range-buttons button.active {
-    background: #1565c0;
-    color: white;
-    border-color: #1565c0;
-}
-
-.custom-range {
-    margin-top: 6px;
-}
-
-.custom-range input {
-    padding: 6px 10px;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-    margin-right: 6px;
-}
-
-.chart-status {
-    color: #c62828;
-    min-height: 1.2em;
+h1 {
+    font-size: 19px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    margin: 0;
 }
 
 .nav-link {
-    display: inline-block;
-    margin-bottom: 16px;
+    font-size: 13px;
+    text-decoration: none;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    padding: 6px 12px;
+    border-radius: 6px;
 }
+
+.nav-link:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.version-tag {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 11px;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 10px;
+    white-space: nowrap;
+}
+
+h2 {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin: 0 0 12px;
+}
+
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+    margin-bottom: 22px;
+}
+
+/* --- Instrument tiles --- */
+
+.tile-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+    gap: 12px;
+    margin-bottom: 22px;
+}
+
+.tile {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px 14px 18px;
+    position: relative;
+    overflow: hidden;
+}
+
+.tile::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 4px;
+    background: var(--status-color, var(--text-muted));
+}
+
+.tile-label {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+
+.tile-value {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 32px;
+    font-weight: 600;
+    line-height: 1.1;
+    color: var(--text);
+}
+
+.tile-unit {
+    font-size: 16px;
+    color: var(--text-muted);
+    margin-left: 3px;
+}
+
+.tile-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-top: 8px;
+}
+
+.tile-time {
+    font-size: 11px;
+    color: var(--text-muted);
+    font-family: 'JetBrains Mono', monospace;
+}
+
+.status-pill {
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 2px 7px;
+    border-radius: 999px;
+    color: var(--ink);
+    background: var(--status-color, var(--text-muted));
+}
+
+/* --- Tables --- */
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 13px;
+}
+
+th, td {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+}
+
+th {
+    color: var(--text-muted);
+    font-weight: 600;
+    text-transform: uppercase;
+    font-size: 11px;
+    letter-spacing: 0.05em;
+}
+
+td {
+    font-family: 'JetBrains Mono', monospace;
+}
+
+tr:hover td {
+    background: var(--panel-raised);
+}
+
+.status-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    margin-right: 6px;
+    background: var(--accent);
+}
+
+/* --- Chart controls --- */
+
+.metric-buttons, .range-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-bottom: 10px;
+}
+
+.metric-buttons button, .range-buttons button {
+    font-family: inherit;
+    font-size: 12px;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel-raised);
+    color: var(--text-muted);
+    cursor: pointer;
+}
+
+.metric-buttons button.active, .range-buttons button.active {
+    background: var(--accent);
+    color: var(--ink);
+    border-color: var(--accent);
+    font-weight: 600;
+}
+
+.metric-buttons button:hover, .range-buttons button:hover {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.custom-range {
+    margin-bottom: 10px;
+}
+
+.custom-range input {
+    font-family: inherit;
+    font-size: 12px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel-raised);
+    color: var(--text);
+    margin-right: 6px;
+}
+
+.custom-range button {
+    font-family: inherit;
+    font-size: 12px;
+    padding: 6px 12px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--panel-raised);
+    color: var(--text-muted);
+    cursor: pointer;
+}
+
+.chart-status {
+    color: var(--alarm);
+    min-height: 1.2em;
+    font-size: 13px;
+}
+
+/* --- Raw data filter form --- */
 
 .filter-form {
     display: flex;
     flex-wrap: wrap;
-    align-items: center;
+    align-items: flex-end;
     gap: 14px;
-    margin-bottom: 18px;
+    margin-bottom: 16px;
 }
 
 .filter-form label {
     display: flex;
     flex-direction: column;
-    font-size: 13px;
-    color: #444;
-    gap: 4px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+    gap: 5px;
 }
 
 .filter-form input, .filter-form select {
-    padding: 6px 8px;
-    border: 1px solid #ccc;
+    font-family: inherit;
+    padding: 7px 9px;
+    border: 1px solid var(--border);
     border-radius: 6px;
+    background: var(--panel-raised);
+    color: var(--text);
 }
 
 .filter-form button, .filter-form a.button-link {
-    padding: 7px 14px;
+    font-family: inherit;
+    padding: 8px 16px;
     border-radius: 6px;
-    border: 1px solid #1565c0;
-    background: #1565c0;
-    color: white;
+    border: 1px solid var(--accent);
+    background: var(--accent);
+    color: var(--ink);
+    font-weight: 600;
     cursor: pointer;
     text-decoration: none;
-    align-self: flex-end;
 }
 
 .filter-form a.reset-link {
-    align-self: flex-end;
-    color: #555;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 13px;
+    padding-bottom: 9px;
 }
 
 .pagination {
@@ -413,41 +729,80 @@ th {
     align-items: center;
     gap: 12px;
     margin: 14px 0;
+    font-size: 13px;
 }
 
 .pagination a {
     padding: 6px 12px;
-    border: 1px solid #ccc;
+    border: 1px solid var(--border);
     border-radius: 6px;
-    background: #f0f0f0;
+    background: var(--panel-raised);
     text-decoration: none;
-    color: #222;
+    color: var(--text);
 }
 
 .pagination span.disabled {
     padding: 6px 12px;
     border-radius: 6px;
-    color: #aaa;
-    border: 1px solid #eee;
+    color: var(--text-muted);
+    border: 1px solid var(--border);
 }
 
 .row-count {
-    color: #555;
-    font-size: 14px;
+    color: var(--text-muted);
+    font-size: 13px;
+}
+
+.empty-state {
+    color: var(--text-muted);
+    font-size: 13px;
+    padding: 10px 0;
+}
+
+/* --- Mobile --- */
+
+@media (max-width: 600px) {
+    body {
+        padding: 14px 14px 50px;
+    }
+    .tile-value {
+        font-size: 26px;
+    }
+    .panel {
+        padding: 14px;
+    }
+    .filter-form {
+        flex-direction: column;
+        align-items: stretch;
+    }
 }
 """
 
 DASHBOARD_JS = r"""
 let currentRange = '24h';
+let currentMetric = 'ph';
+
+const METRIC_LABELS = {};
+document.querySelectorAll('[data-metric-label]').forEach(function (el) {
+    METRIC_LABELS[el.dataset.metric] = el.dataset.metricLabel;
+});
 
 function highlightActiveButton(range) {
     document.querySelectorAll('.range-buttons button').forEach(function (btn) {
-        if (btn.dataset.range === range) {
-            btn.classList.add('active');
-        } else {
-            btn.classList.remove('active');
-        }
+        btn.classList.toggle('active', btn.dataset.range === range);
     });
+}
+
+function highlightActiveMetric(metric) {
+    document.querySelectorAll('.metric-buttons button').forEach(function (btn) {
+        btn.classList.toggle('active', btn.dataset.metric === metric);
+    });
+}
+
+function setMetric(metric) {
+    currentMetric = metric;
+    highlightActiveMetric(metric);
+    loadChart(currentRange);
 }
 
 async function loadChart(range) {
@@ -459,7 +814,10 @@ async function loadChart(range) {
 
     let response;
     try {
-        response = await fetch('/api/ph/ohlc?range=' + encodeURIComponent(range));
+        response = await fetch(
+            '/api/ph/ohlc?range=' + encodeURIComponent(range) +
+            '&metric=' + encodeURIComponent(currentMetric)
+        );
     } catch (err) {
         statusEl.textContent = 'Could not reach the server.';
         return;
@@ -469,13 +827,13 @@ async function loadChart(range) {
 
     if (result.error) {
         statusEl.textContent = result.error;
-        Plotly.purge('phChart');
+        Plotly.purge('trendChart');
         return;
     }
 
     if (!result.data || result.data.length === 0) {
         statusEl.textContent = 'No readings in this time range yet.';
-        Plotly.purge('phChart');
+        Plotly.purge('trendChart');
         return;
     }
 
@@ -485,26 +843,27 @@ async function loadChart(range) {
     const low = result.data.map(r => r.low);
     const close = result.data.map(r => r.close);
 
+    const label = METRIC_LABELS[currentMetric] || currentMetric;
+
     const trace = {
-        x: x,
-        open: open,
-        high: high,
-        low: low,
-        close: close,
+        x: x, open: open, high: high, low: low, close: close,
         type: 'candlestick',
-        name: 'pH',
-        increasing: { line: { color: '#2e7d32' } },
-        decreasing: { line: { color: '#c62828' } }
+        name: label,
+        increasing: { line: { color: '#4FD1C5' } },
+        decreasing: { line: { color: '#E5484D' } }
     };
 
     const layout = {
-        title: 'Pool pH (' + range + ')',
-        xaxis: { title: 'Time', rangeslider: { visible: false } },
-        yaxis: { title: 'pH' },
-        margin: { t: 40, r: 20, l: 50, b: 40 }
+        paper_bgcolor: '#16252D',
+        plot_bgcolor: '#16252D',
+        font: { color: '#8FA3AA', family: 'Inter, sans-serif', size: 11 },
+        title: { text: label + ' \u00b7 ' + range, font: { color: '#E8EDEE', size: 14 } },
+        xaxis: { title: '', rangeslider: { visible: false }, gridcolor: '#283940', linecolor: '#283940' },
+        yaxis: { title: '', gridcolor: '#283940', linecolor: '#283940' },
+        margin: { t: 36, r: 16, l: 44, b: 32 }
     };
 
-    Plotly.react('phChart', [trace], layout, { responsive: true });
+    Plotly.react('trendChart', [trace], layout, { responsive: true, displayModeBar: false });
 }
 
 function loadCustomRange() {
@@ -529,161 +888,35 @@ loadChart('24h');
 """
 
 
-def render_dashboard_page(ph_display, latest_timestamp, status_html, table_rows):
-    return f"""<html>
-<head>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <title>PoolMonitor</title>
-    <style>{DASHBOARD_CSS}</style>
-</head>
-<body>
-    <h1>PoolMonitor</h1>
-    <a class="nav-link" href="/data">View Raw Data →</a>
+def render_metric_tile(metric, latest_value, latest_timestamp):
+    status_color = "var(--text-muted)"
+    status_label = "NO DATA"
 
-    <div class="card">
-        <h2>Current pH</h2>
-        <div class="ph-value">{ph_display}</div>
-        <p>Last reading: {latest_timestamp}</p>
-    </div>
+    if latest_value is not None:
+        low, high = metric["low"], metric["high"]
+        if low is not None and high is not None:
+            if low <= latest_value <= high:
+                status_color = "var(--accent)"
+                status_label = "IN RANGE"
+            else:
+                status_color = "var(--warn)"
+                status_label = "OUT OF RANGE"
+        else:
+            status_color = "var(--accent)"
+            status_label = "LIVE"
 
-    <h2>System Status</h2>
-    <table>
-        <tr><th>Component</th><th>Status</th><th>Last Updated</th></tr>
-        {status_html}
-    </table>
+    if latest_value is not None:
+        value_str = f"{latest_value:.{metric['decimals']}f}"
+    else:
+        value_str = "--"
 
-    <br>
+    unit_html = f'<span class="tile-unit">{metric["unit"]}</span>' if metric["unit"] else ""
+    time_str = latest_timestamp if latest_value is not None else "--"
 
-    <h2>pH Trend</h2>
-    <div class="card">
-        <div class="range-buttons">
-            <button data-range="1h" class="active" onclick="loadChart('1h')">1H</button>
-            <button data-range="6h" onclick="loadChart('6h')">6H</button>
-            <button data-range="12h" onclick="loadChart('12h')">12H</button>
-            <button data-range="24h" onclick="loadChart('24h')">24H</button>
-            <button data-range="3d" onclick="loadChart('3d')">3D</button>
-            <button data-range="7d" onclick="loadChart('7d')">1W</button>
-            <button data-range="30d" onclick="loadChart('30d')">1M</button>
-            <button data-range="90d" onclick="loadChart('90d')">3M</button>
-            <button data-range="6m" onclick="loadChart('6m')">6M</button>
-            <button data-range="1y" onclick="loadChart('1y')">1Y</button>
-        </div>
-        <div class="custom-range">
-            <input type="text" id="customRange" placeholder="custom, e.g. 45d, 2w, 6m">
-            <button onclick="loadCustomRange()">Go</button>
-        </div>
-        <p id="chartStatus" class="chart-status"></p>
-        <div id="phChart" style="height: 420px;"></div>
-    </div>
-
-    <h2>Recent Readings</h2>
-    <table>
-        <tr><th>Timestamp</th><th>pH</th></tr>
-        {table_rows}
-    </table>
-
-    <script>{DASHBOARD_JS}</script>
-</body>
-</html>"""
-
-
-def render_raw_data_page(
-    table_rows, page, total_pages, total_count, page_size,
-    start_value, end_value, order, prev_url, next_url, first_url, last_url, export_url,
-):
-    desc_selected = "selected" if order == "desc" else ""
-    asc_selected = "selected" if order == "asc" else ""
-
-    size_options = "".join(
-        f'<option value="{size}" {"selected" if size == page_size else ""}>{size}</option>'
-        for size in (50, 100, 250, 500, 1000)
-    )
-
-    prev_html = f'<a href="{prev_url}">‹ Prev</a>' if prev_url else '<span class="disabled">‹ Prev</span>'
-    next_html = f'<a href="{next_url}">Next ›</a>' if next_url else '<span class="disabled">Next ›</span>'
-    first_html = f'<a href="{first_url}">« First</a>' if page > 1 else '<span class="disabled">« First</span>'
-    last_html = f'<a href="{last_url}">Last »</a>' if page < total_pages else '<span class="disabled">Last »</span>'
-
-    return f"""<html>
-<head>
-    <title>PoolMonitor - Raw Data</title>
-    <style>{DASHBOARD_CSS}</style>
-</head>
-<body>
-    <a class="nav-link" href="/">← Back to Dashboard</a>
-    <h1>Raw Readings</h1>
-    <p class="row-count">{total_count} total rows</p>
-
-    <form method="get" action="/data" class="filter-form">
-        <label>Start
-            <input type="datetime-local" name="start" value="{start_value}">
-        </label>
-        <label>End
-            <input type="datetime-local" name="end" value="{end_value}">
-        </label>
-        <label>Order
-            <select name="order">
-                <option value="desc" {desc_selected}>Newest first</option>
-                <option value="asc" {asc_selected}>Oldest first</option>
-            </select>
-        </label>
-        <label>Rows per page
-            <select name="page_size">
-                {size_options}
-            </select>
-        </label>
-        <button type="submit">Apply</button>
-        <a class="reset-link" href="/data">Reset</a>
-        <a class="button-link" href="{export_url}">Download CSV</a>
-    </form>
-
-    <div class="pagination">
-        {first_html}
-        {prev_html}
-        <span>Page {page} of {total_pages}</span>
-        {next_html}
-        {last_html}
-    </div>
-
-    <table>
-        <tr><th>ID</th><th>Timestamp</th><th>pH</th><th>Temp (°C)</th><th>Salinity (ppm)</th></tr>
-        {table_rows}
-    </table>
-
-    <div class="pagination">
-        {first_html}
-        {prev_html}
-        <span>Page {page} of {total_pages}</span>
-        {next_html}
-        {last_html}
-    </div>
-</body>
-</html>"""
-
-
-@app.route("/")
-def home():
-    rows = query_db("SELECT timestamp, ph FROM readings ORDER BY id DESC LIMIT 100")
-    status_rows = query_db(
-        "SELECT component, status, last_updated FROM system_status ORDER BY id DESC LIMIT 5"
-    )
-
-    latest_timestamp = rows[0][0] if rows else "No readings"
-    latest_ph = rows[0][1] if rows else None
-    ph_display = f"{latest_ph:.2f}" if latest_ph is not None else "--"
-
-    table_rows = "".join(
-        f"<tr><td>{timestamp}</td><td>{ph:.3f}</td></tr>"
-        for timestamp, ph in rows
-    )
-
-    status_html = "".join(
-        f"<tr><td>{component}</td><td>{status}</td><td>{last_updated}</td></tr>"
-        for component, status, last_updated in status_rows
-    )
-
-    return render_dashboard_page(ph_display, latest_timestamp, status_html, table_rows)
-
-
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    return f"""
+    <div class="tile" style="--status-color: {status_color};">
+        <div class="tile-label">{metric['label']}</div>
+        <div class="tile-value">{value_str}{unit_html}</div>
+        <div class="tile-meta">
+            <span class="tile-time">{time_str}</span>
+            <span class="status-pill" style="--status-col

@@ -3,7 +3,7 @@ pool:
   volume_litres: 50000
 
 logging:
-  interval_seconds: 3
+  interval_seconds: 60
 
 targets:
   ph_low: 7.2
