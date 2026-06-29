@@ -1,4 +1,4 @@
-[200~import csv
+import csv
 import io
 import re
 import sqlite3
@@ -919,4 +919,233 @@ def render_metric_tile(metric, latest_value, latest_timestamp):
         <div class="tile-value">{value_str}{unit_html}</div>
         <div class="tile-meta">
             <span class="tile-time">{time_str}</span>
-            <span class="status-pill" style="--status-col
+            <span class="status-pill" style="--status-color: {status_color};">{status_label}</span>
+        </div>
+    </div>
+    """
+
+
+def render_metric_buttons():
+    buttons = []
+    for i, metric in enumerate(METRICS):
+        active = "active" if i == 0 else ""
+        buttons.append(
+            f'<button data-metric="{metric["id"]}" class="{active}" '
+            f'onclick="setMetric(\'{metric["id"]}\')">{metric["label"]}</button>'
+        )
+        buttons.append(
+            f'<span data-metric="{metric["id"]}" data-metric-label="{metric["label"]}" style="display:none;"></span>'
+        )
+    return "".join(buttons)
+
+
+def render_dashboard_page(tiles_html, status_html, table_rows, server_time, has_readings):
+    table_block = (
+        '<table><tr><th>Timestamp</th><th>pH</th><th>Temp (&deg;C)</th></tr>' + table_rows + '</table>'
+        if has_readings else
+        '<p class="empty-state">No readings yet. Once the logger starts writing data, recent readings will appear here.</p>'
+    )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+    <title>PoolMonitor</title>
+    <style>{DASHBOARD_CSS}</style>
+</head>
+<body>
+    <div class="topbar">
+        <div class="topbar-left">
+            <span class="live-dot"></span>
+            <h1>PoolMonitor</h1>
+            <a class="nav-link" href="/data">Raw Data</a>
+        </div>
+        <div class="version-tag">v{DASHBOARD_VERSION} &middot; {server_time}</div>
+    </div>
+
+    <div class="tile-grid">
+        {tiles_html}
+    </div>
+
+    <div class="panel">
+        <h2>System Status</h2>
+        <table>
+            <tr><th>Component</th><th>Status</th><th>Last Updated</th></tr>
+            {status_html}
+        </table>
+    </div>
+
+    <div class="panel">
+        <h2>Trends</h2>
+        <div class="metric-buttons">
+            {render_metric_buttons()}
+        </div>
+        <div class="range-buttons">
+            <button data-range="1h" class="active" onclick="loadChart('1h')">1H</button>
+            <button data-range="6h" onclick="loadChart('6h')">6H</button>
+            <button data-range="12h" onclick="loadChart('12h')">12H</button>
+            <button data-range="24h" onclick="loadChart('24h')">24H</button>
+            <button data-range="3d" onclick="loadChart('3d')">3D</button>
+            <button data-range="7d" onclick="loadChart('7d')">1W</button>
+            <button data-range="30d" onclick="loadChart('30d')">1M</button>
+            <button data-range="90d" onclick="loadChart('90d')">3M</button>
+            <button data-range="6m" onclick="loadChart('6m')">6M</button>
+            <button data-range="1y" onclick="loadChart('1y')">1Y</button>
+        </div>
+        <div class="custom-range">
+            <input type="text" id="customRange" placeholder="custom, e.g. 45d, 2w, 6m">
+            <button onclick="loadCustomRange()">Go</button>
+        </div>
+        <p id="chartStatus" class="chart-status"></p>
+        <div id="trendChart" style="height: 360px;"></div>
+    </div>
+
+    <div class="panel">
+        <h2>Recent Readings</h2>
+        {table_block}
+    </div>
+
+    <script>{DASHBOARD_JS}</script>
+</body>
+</html>"""
+
+
+def render_raw_data_page(
+    table_rows, page, total_pages, total_count, page_size,
+    start_value, end_value, order, prev_url, next_url, first_url, last_url, export_url,
+):
+    desc_selected = "selected" if order == "desc" else ""
+    asc_selected = "selected" if order == "asc" else ""
+
+    size_options = "".join(
+        f'<option value="{size}" {"selected" if size == page_size else ""}>{size}</option>'
+        for size in (50, 100, 250, 500, 1000)
+    )
+
+    prev_html = f'<a href="{prev_url}">&lsaquo; Prev</a>' if prev_url else '<span class="disabled">&lsaquo; Prev</span>'
+    next_html = f'<a href="{next_url}">Next &rsaquo;</a>' if next_url else '<span class="disabled">Next &rsaquo;</span>'
+    first_html = f'<a href="{first_url}">&laquo; First</a>' if page > 1 else '<span class="disabled">&laquo; First</span>'
+    last_html = f'<a href="{last_url}">Last &raquo;</a>' if page < total_pages else '<span class="disabled">Last &raquo;</span>'
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
+    <title>PoolMonitor &middot; Raw Data</title>
+    <style>{DASHBOARD_CSS}</style>
+</head>
+<body>
+    <div class="topbar">
+        <div class="topbar-left">
+            <span class="live-dot"></span>
+            <h1>Raw Readings</h1>
+            <a class="nav-link" href="/">&larr; Dashboard</a>
+        </div>
+        <div class="version-tag">v{DASHBOARD_VERSION} &middot; {datetime.now().isoformat(timespec='seconds')}</div>
+    </div>
+
+    <div class="panel">
+        <p class="row-count">{total_count} total rows</p>
+
+        <form method="get" action="/data" class="filter-form">
+            <label>Start
+                <input type="datetime-local" name="start" value="{start_value}">
+            </label>
+            <label>End
+                <input type="datetime-local" name="end" value="{end_value}">
+            </label>
+            <label>Order
+                <select name="order">
+                    <option value="desc" {desc_selected}>Newest first</option>
+                    <option value="asc" {asc_selected}>Oldest first</option>
+                </select>
+            </label>
+            <label>Rows per page
+                <select name="page_size">
+                    {size_options}
+                </select>
+            </label>
+            <button type="submit">Apply</button>
+            <a class="reset-link" href="/data">Reset</a>
+            <a class="button-link" href="{export_url}">Download CSV</a>
+        </form>
+
+        <div class="pagination">
+            {first_html}
+            {prev_html}
+            <span>Page {page} of {total_pages}</span>
+            {next_html}
+            {last_html}
+        </div>
+
+        <table>
+            <tr><th>ID</th><th>Timestamp</th><th>pH</th><th>Temp (&deg;C)</th><th>Salinity (ppm)</th></tr>
+            {table_rows}
+        </table>
+
+        <div class="pagination">
+            {first_html}
+            {prev_html}
+            <span>Page {page} of {total_pages}</span>
+            {next_html}
+            {last_html}
+        </div>
+    </div>
+</body>
+</html>"""
+
+
+@app.route("/")
+def home():
+    rows = query_db(
+        "SELECT timestamp, ph, temperature_c FROM readings ORDER BY id DESC LIMIT 100"
+    )
+    status_rows = query_db(
+        "SELECT component, status, last_updated FROM system_status ORDER BY id DESC LIMIT 5"
+    )
+
+    latest_timestamp = rows[0][0] if rows else None
+    latest_ph = rows[0][1] if rows else None
+    latest_temp = rows[0][2] if rows else None
+
+    latest_values = {"ph": latest_ph, "temperature": latest_temp, "salinity": None}
+
+    tiles_html = "".join(
+        render_metric_tile(metric, latest_values.get(metric["id"]), latest_timestamp or "--")
+        for metric in METRICS
+    )
+
+    table_rows = "".join(
+        "<tr><td>{ts}</td><td>{ph}</td><td>{temp}</td></tr>".format(
+            ts=timestamp,
+            ph=f"{ph:.3f}" if ph is not None else "--",
+            temp=f"{temp:.2f}" if temp is not None else "--",
+        )
+        for timestamp, ph, temp in rows
+    )
+
+    if status_rows:
+        status_html = "".join(
+            f'<tr><td><span class="status-dot"></span>{component}</td>'
+            f'<td>{status}</td><td>{last_updated}</td></tr>'
+            for component, status, last_updated in status_rows
+        )
+    else:
+        status_html = '<tr><td colspan="3" class="empty-state">No status reports yet.</td></tr>'
+
+    return render_dashboard_page(
+        tiles_html, status_html, table_rows,
+        server_time=datetime.now().isoformat(timespec="seconds"),
+        has_readings=bool(rows),
+    )
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)
