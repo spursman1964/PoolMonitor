@@ -13,7 +13,7 @@ app = Flask(__name__)
 
 # Bump this whenever dashboard.py changes. Shown in the top bar so you can
 # confirm at a glance whether the browser/service is serving the latest code.
-DASHBOARD_VERSION = "2.1.0 (adaptive chart granularity)"
+DASHBOARD_VERSION = "2.2.0 (salinity tile and table)"
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = PROJECT_ROOT / "data" / "poolmonitor.db"
@@ -941,7 +941,7 @@ def render_metric_buttons():
 
 def render_dashboard_page(tiles_html, status_html, table_rows, server_time, has_readings):
     table_block = (
-        '<table><tr><th>Timestamp</th><th>pH</th><th>Temp (&deg;C)</th></tr>' + table_rows + '</table>'
+        '<table><tr><th>Timestamp</th><th>pH</th><th>Temp (&deg;C)</th><th>Salinity (ppm)</th></tr>' + table_rows + '</table>'
         if has_readings else
         '<p class="empty-state">No readings yet. Once the logger starts writing data, recent readings will appear here.</p>'
     )
@@ -1105,7 +1105,7 @@ def render_raw_data_page(
 @app.route("/")
 def home():
     rows = query_db(
-        "SELECT timestamp, ph, temperature_c FROM readings ORDER BY id DESC LIMIT 100"
+        "SELECT timestamp, ph, temperature_c, salinity_ppm FROM readings ORDER BY id DESC LIMIT 100"
     )
     status_rows = query_db(
         "SELECT component, status, last_updated FROM system_status ORDER BY id DESC LIMIT 5"
@@ -1114,8 +1114,9 @@ def home():
     latest_timestamp = rows[0][0] if rows else None
     latest_ph = rows[0][1] if rows else None
     latest_temp = rows[0][2] if rows else None
+    latest_sal = rows[0][3] if rows else None
 
-    latest_values = {"ph": latest_ph, "temperature": latest_temp, "salinity": None}
+    latest_values = {"ph": latest_ph, "temperature": latest_temp, "salinity": latest_sal}
 
     tiles_html = "".join(
         render_metric_tile(metric, latest_values.get(metric["id"]), latest_timestamp or "--")
@@ -1123,12 +1124,13 @@ def home():
     )
 
     table_rows = "".join(
-        "<tr><td>{ts}</td><td>{ph}</td><td>{temp}</td></tr>".format(
+        "<tr><td>{ts}</td><td>{ph}</td><td>{temp}</td><td>{sal}</td></tr>".format(
             ts=timestamp,
             ph=f"{ph:.3f}" if ph is not None else "--",
             temp=f"{temp:.2f}" if temp is not None else "--",
+            sal=f"{sal:.0f}" if sal is not None else "--",
         )
-        for timestamp, ph, temp in rows
+        for timestamp, ph, temp, sal in rows
     )
 
     if status_rows:

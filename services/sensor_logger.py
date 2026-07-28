@@ -19,9 +19,10 @@ sys.path.append(str(PROJECT_ROOT / "sensors"))
 
 from ph_sensor import read_ph
 from temperature_sensor import read_temperature
+from ec_sensor import read_salinity_ppm
 
 
-def store_reading(ph_value, temperature_value):
+def store_reading(ph_value, temperature_value, salinity_value):
 
     connection = sqlite3.connect(DB_PATH)
     cursor = connection.cursor()
@@ -29,13 +30,14 @@ def store_reading(ph_value, temperature_value):
     cursor.execute(
         """
         INSERT INTO readings
-        (timestamp, ph, temperature_c)
-        VALUES (?, ?, ?)
+        (timestamp, ph, temperature_c, salinity_ppm)
+        VALUES (?, ?, ?, ?)
         """,
         (
             datetime.now().isoformat(timespec="seconds"),
             ph_value,
             temperature_value,
+            salinity_value,
         ),
     )
 
@@ -47,6 +49,7 @@ while True:
 
     ph = None
     temperature = None
+    salinity = None
 
     try:
         ph = read_ph()
@@ -58,13 +61,19 @@ while True:
     except Exception as error:
         print(f"ERROR reading temperature: {error}")
 
-    if ph is not None or temperature is not None:
+    try:
+        # Pass temperature for compensation if available
+        salinity = read_salinity_ppm(temperature_c=temperature)
+    except Exception as error:
+        print(f"ERROR reading EC: {error}")
+
+    if ph is not None or temperature is not None or salinity is not None:
         try:
-            store_reading(ph, temperature)
+            store_reading(ph, temperature, salinity)
 
             print(
                 f"{datetime.now().isoformat(timespec='seconds')} "
-                f"pH={ph} temp_c={temperature}"
+                f"pH={ph} temp_c={temperature} salinity_ppm={salinity}"
             )
         except Exception as error:
             print(f"ERROR storing reading: {error}")
